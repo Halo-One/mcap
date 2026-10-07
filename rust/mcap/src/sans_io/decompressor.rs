@@ -12,6 +12,8 @@ pub trait Decompressor: Send {
     /// Returns the recommended size of input to pass into `decompress()`.
     fn next_read_size(&self) -> usize;
     /// Decompresses up to `dst.len()` bytes, consuming up to `src.len()` bytes from `src`.
+    /// Empty input may still produce buffered output. If neither input is consumed nor output
+    /// produced, the caller must supply more input before retrying.
     fn decompress(&mut self, src: &[u8], dst: &mut [u8]) -> McapResult<DecompressResult>;
     /// Resets the internal state of the decompressor.
     fn reset(&mut self) -> McapResult<()>;

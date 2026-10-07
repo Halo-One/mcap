@@ -873,6 +873,21 @@ fn decompress_inner(
         let src_len = have.min(clamp_to_usize(*compressed_remaining));
         let src = &src_buf.unread()[..src_len];
         let res = decompressor.decompress(src, dst)?;
+        if res.consumed == 0 && res.wrote == 0 {
+            // Empty input can drain buffered output, but retrying a stalled decoder with
+            // the same input cannot make progress. Only bytes in the declared payload count:
+            // file_data may also contain padding or subsequent records.
+            if src_len as u64 == *compressed_remaining {
+                return Err(McapError::UnexpectedEoc);
+            }
+            // The decoder's read size is a hint, and can be zero or no larger than the
+            // input it just rejected. Request at least one more byte before retrying.
+            let need = decompressor
+                .next_read_size()
+                .max(src_len + 1)
+                .min(clamp_to_usize(*compressed_remaining));
+            return Ok(Some(need - src_len));
+        }
         src_buf.mark_read(res.consumed);
         dest_buf.mark_written(res.wrote);
         *compressed_remaining -= res.consumed as u64;
@@ -1127,6 +1142,195 @@ mod tests {
         );
         assert!(max_insert <= 1024);
         assert_matches!(err, Some(McapError::ChunkTooLarge(n)) if n == 40 + HUGE as u64);
+    }
+
+    fn append_unfinished_chunk(bytes: &mut Vec<u8>, compression: &str) {
+        bytes.push(op::CHUNK);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]); // message times
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&(compression.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(compression.as_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // compressed size
+        bytes.extend_from_slice(&[0; 128]); // not part of the compressed payload
+    }
+
+    #[test]
+    fn test_unfinished_compressed_chunk() {
+        for compression in ["zstd", "lz4"] {
+            let mut bytes = MAGIC.to_vec();
+            bytes.push(op::HEADER);
+            bytes.extend_from_slice(&8u64.to_le_bytes());
+            bytes.extend_from_slice(&[0; 8]);
+            append_unfinished_chunk(&mut bytes, compression);
+            if compression == "zstd" {
+                assert_eq!(bytes.len(), 206);
+            }
+            let mut messages = crate::MessageStream::new_with_options(
+                &bytes,
+                crate::read::Options::IgnoreEndMagic.into(),
+            )
+            .unwrap();
+            assert_matches!(messages.next(), Some(Err(McapError::UnexpectedEoc)));
+
+            // Also exercise a source buffer already containing the trailing zeros.
+            let mut reader = LinearReader::new();
+            reader.insert(bytes.len()).copy_from_slice(&bytes);
+            reader.notify_read(bytes.len());
+            assert_matches!(
+                reader.next_event(),
+                Some(Ok(LinearReadEvent::Record {
+                    opcode: op::HEADER,
+                    ..
+                }))
+            );
+            assert_matches!(reader.next_event(), Some(Err(McapError::UnexpectedEoc)));
+        }
+    }
+
+    // Find a top-level record without decompressing chunks.
+    fn record_offset(bytes: &[u8], opcode: u8) -> usize {
+        let mut offset = MAGIC.len();
+        while bytes[offset] != opcode {
+            let len = u64::from_le_bytes(bytes[offset + 1..offset + 9].try_into().unwrap());
+            offset += OPCODE_LEN_SIZE + len as usize;
+        }
+        offset
+    }
+
+    #[test]
+    fn test_messages_before_unfinished_chunk() -> McapResult<()> {
+        for (compression, name) in [(Compression::Zstd, "zstd"), (Compression::Lz4, "lz4")] {
+            let mut bytes = basic_chunked_file(Some(compression))?;
+            bytes.truncate(record_offset(&bytes, op::DATA_END));
+            append_unfinished_chunk(&mut bytes, name);
+            let mut messages = crate::MessageStream::new_with_options(
+                &bytes,
+                crate::read::Options::IgnoreEndMagic.into(),
+            )?;
+            for sequence in 0..3 {
+                let message = messages.next().unwrap()?;
+                assert_eq!(message.sequence, sequence);
+                assert_eq!(message.data.as_ref(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+            }
+            assert_matches!(messages.next(), Some(Err(McapError::UnexpectedEoc)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_exhausted_compressed_chunk_with_incorrect_size() -> McapResult<()> {
+        for compression in [Compression::Zstd, Compression::Lz4] {
+            for options in [
+                LinearReaderOptions::default(),
+                LinearReaderOptions::default().with_validate_chunk_crcs(true),
+                LinearReaderOptions::default().with_prevalidate_chunk_crcs(true),
+            ] {
+                let mut bytes = basic_chunked_file(Some(compression))?;
+                let chunk = record_offset(&bytes, op::CHUNK);
+                let size_offset = chunk + OPCODE_LEN_SIZE + 16;
+                let size =
+                    u64::from_le_bytes(bytes[size_offset..size_offset + 8].try_into().unwrap());
+                bytes[size_offset..size_offset + 8].copy_from_slice(&(size + 9).to_le_bytes());
+                let (err, _) = drive_linear_reader(&bytes, options);
+                assert_matches!(err, Some(McapError::UnexpectedEoc));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_physically_truncated_compressed_chunk() -> McapResult<()> {
+        for (compression, name) in [(Compression::Zstd, "zstd"), (Compression::Lz4, "lz4")] {
+            let mut bytes = basic_chunked_file(Some(compression))?;
+            let chunk = record_offset(&bytes, op::CHUNK);
+            // Leave only the first byte of the compressed frame, while retaining its
+            // original declared size. More payload is needed, but the source is at EOF.
+            bytes.truncate(chunk + OPCODE_LEN_SIZE + 40 + name.len() + 1);
+            for prevalidate in [false, true] {
+                let (err, _) = drive_linear_reader(
+                    &bytes,
+                    LinearReaderOptions::default().with_prevalidate_chunk_crcs(prevalidate),
+                );
+                assert_matches!(err, Some(McapError::UnexpectedEof));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_decompression_drains_buffered_output_and_requests_more_input() {
+        use super::super::decompressor::DecompressResult;
+
+        // A zero read-size hint must not cause a stall or prevent buffered output
+        // from being drained. Require two input bytes, then emit one byte per call.
+        struct BufferedDecoder {
+            buffered: usize,
+        }
+        impl Decompressor for BufferedDecoder {
+            fn next_read_size(&self) -> usize {
+                0
+            }
+            fn decompress(&mut self, src: &[u8], dst: &mut [u8]) -> McapResult<DecompressResult> {
+                let consumed = if self.buffered == 0 && src.len() >= 2 {
+                    self.buffered = 3;
+                    2
+                } else {
+                    0
+                };
+                let wrote = if self.buffered > 0 {
+                    dst[0] = 42;
+                    self.buffered -= 1;
+                    1
+                } else {
+                    0
+                };
+                Ok(DecompressResult { consumed, wrote })
+            }
+            fn reset(&mut self) -> McapResult<()> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "buffered"
+            }
+        }
+        let mut decoder: Box<dyn Decompressor> = Box::new(BufferedDecoder { buffered: 0 });
+        let mut src = RwBuf::new(false);
+        src.tail_with_size(1)[0] = 0;
+        src.mark_written(1);
+        let mut dst = RwBuf::new(false);
+        let mut compressed_remaining = 2;
+        let mut uncompressed_remaining = 3;
+        assert_eq!(
+            decompress_inner(
+                &mut decoder,
+                3,
+                &mut src,
+                &mut dst,
+                &mut compressed_remaining,
+                &mut uncompressed_remaining,
+            )
+            .unwrap(),
+            Some(1)
+        );
+        src.tail_with_size(1)[0] = 0;
+        src.mark_written(1);
+        assert_eq!(
+            decompress_inner(
+                &mut decoder,
+                3,
+                &mut src,
+                &mut dst,
+                &mut compressed_remaining,
+                &mut uncompressed_remaining,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(dst.unread(), &[42; 3]);
+        assert_eq!(compressed_remaining, 0);
+        assert_eq!(uncompressed_remaining, 0);
     }
 
     fn test_chunked(
